@@ -422,6 +422,26 @@ if(TRITON_BUILD_PYTHON_MODULE)
   endif()
   target_link_options(triton PRIVATE ${LLVM_LDFLAGS})
 
+  if(WIN32)
+    # Fix for MSVC link.exe failing to parse long lines in Ninja RSP files.
+    # CMake's Ninja generator puts all LINK_LIBRARIES on a single line in the
+    # response file, which can exceed MSVC link.exe's line parsing capacity.
+    # This PRE_LINK command splits double-space-separated entries onto individual
+    # lines before link.exe runs.
+    set(FIX_RSP_SCRIPT "${CMAKE_CURRENT_BINARY_DIR}/fix_rsp.cmake")
+    file(WRITE ${FIX_RSP_SCRIPT}
+      "file(READ \"\${RSP_FILE}\" content)\n"
+      "string(REPLACE \"  \" \"\\n\" content \"\${content}\")\n"
+      "file(WRITE \"\${RSP_FILE}\" \"\${content}\")\n"
+    )
+    add_custom_command(TARGET triton PRE_LINK
+      COMMAND ${CMAKE_COMMAND}
+        -DRSP_FILE=${CMAKE_CURRENT_BINARY_DIR}/CMakeFiles/triton.rsp
+        -P ${FIX_RSP_SCRIPT}
+      COMMENT "Fixing RSP file line lengths for MSVC link.exe"
+    )
+  endif()
+
   if (NOT DEFINED LLVM_SYSPATH)
       message(FATAL_ERROR "LLVM_SYSPATH must be set.")
   endif()
