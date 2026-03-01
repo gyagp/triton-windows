@@ -26,6 +26,8 @@ import ctypes.util
 import struct
 import os
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import numpy as np
 
 from .llvm_to_wgsl import BufferBinding, ParamField
@@ -214,6 +216,10 @@ class WGPURequestDeviceStatus:
     Success = 0x00000001
 
 
+class WGPUCreatePipelineAsyncStatus:
+    Success = 0x00000001
+
+
 class WGPUBufferBindingType:
     BindingNotUsed = 0x00000000
     Undefined = 0x00000001
@@ -333,6 +339,13 @@ UncapturedErrorCallback = ctypes.CFUNCTYPE(
     None, ctypes.c_void_p, ctypes.c_uint32, WGPUStringView, ctypes.c_void_p, ctypes.c_void_p
 )
 
+# void (*)(WGPUCreatePipelineAsyncStatus status, WGPUComputePipeline pipeline,
+#          WGPUStringView message, void* ud1, void* ud2)
+CreateComputePipelineAsyncCallback = ctypes.CFUNCTYPE(
+    None, ctypes.c_uint32, WGPUComputePipeline, WGPUStringView,
+    ctypes.c_void_p, ctypes.c_void_p
+)
+
 
 # ── Callback info structs ──
 
@@ -361,6 +374,16 @@ class WGPUBufferMapCallbackInfo(ctypes.Structure):
         ("nextInChain", ctypes.POINTER(WGPUChainedStruct)),
         ("mode", ctypes.c_uint32),
         ("callback", BufferMapCallback),
+        ("userdata1", ctypes.c_void_p),
+        ("userdata2", ctypes.c_void_p),
+    ]
+
+
+class WGPUCreateComputePipelineAsyncCallbackInfo(ctypes.Structure):
+    _fields_ = [
+        ("nextInChain", ctypes.POINTER(WGPUChainedStruct)),
+        ("mode", ctypes.c_uint32),
+        ("callback", CreateComputePipelineAsyncCallback),
         ("userdata1", ctypes.c_void_p),
         ("userdata2", ctypes.c_void_p),
     ]
@@ -723,6 +746,15 @@ def _setup_prototypes(lib):
     ]
     lib.wgpuDeviceCreateComputePipeline.restype = WGPUComputePipeline
 
+    # wgpuDeviceCreateComputePipelineAsync (if exported by Dawn)
+    if hasattr(lib, 'wgpuDeviceCreateComputePipelineAsync'):
+        lib.wgpuDeviceCreateComputePipelineAsync.argtypes = [
+            WGPUDevice,
+            ctypes.POINTER(WGPUComputePipelineDescriptor),
+            WGPUCreateComputePipelineAsyncCallbackInfo,
+        ]
+        lib.wgpuDeviceCreateComputePipelineAsync.restype = WGPUFuture
+
     # wgpuDeviceCreateBuffer
     lib.wgpuDeviceCreateBuffer.argtypes = [
         WGPUDevice, ctypes.POINTER(WGPUBufferDescriptor)
@@ -1026,7 +1058,16 @@ class DawnRunner:
         opts = WGPURequestAdapterOptions()
         opts.nextInChain = ctypes.cast(ctypes.pointer(adapter_toggles), ctypes.POINTER(WGPUChainedStruct))
         opts.featureLevel = WGPUFeatureLevel.Core
-        opts.powerPreference = WGPUPowerPreference.HighPerformance
+
+        # GPU selection via DAWN_GPU environment variable:
+        #   DAWN_GPU=0 or "high" → HighPerformance (discrete GPU, default)
+        #   DAWN_GPU=1 or "low"  → LowPower (integrated GPU)
+        gpu_env = os.environ.get("DAWN_GPU", "").strip().lower()
+        if gpu_env in ("1", "low", "integrated"):
+            opts.powerPreference = WGPUPowerPreference.LowPower
+        else:
+            opts.powerPreference = WGPUPowerPreference.HighPerformance
+
         opts.forceFallbackAdapter = 0
         opts.backendType = WGPUBackendType.D3D12  # Use D3D12 on Windows
         opts.compatibleSurface = None
@@ -1163,9 +1204,14 @@ class DawnRunner:
             raise RuntimeError("Failed to create Dawn WebGPU device")
 
         self._queue = self._lib.wgpuDeviceGetQueue(self._device)
+        self._has_async_compute_pipeline = hasattr(
+            self._lib, 'wgpuDeviceCreateComputePipelineAsync')
 
         # Cache for pipelines and shader modules
         self._pipeline_cache = {}  # wgsl_hash -> (shader_module, pipeline, bg_layout, pipeline_layout)
+        self._pipeline_cache_lock = threading.RLock()
+        self._pipeline_executor = ThreadPoolExecutor(
+            max_workers=max(1, min(8, (os.cpu_count() or 4))))
         # Cache for GPU buffers to avoid per-call alloc/dealloc
         self._buffer_cache = {}  # (name, size, usage) -> WGPUBuffer
         # Toggle pool for gpu_outputs — avoids fresh allocation each call
@@ -1174,20 +1220,33 @@ class DawnRunner:
         self._total_gpu_bytes = 0
         self._gpu_alloc_count = 0
 
+        # Size-class buffer pool: reuses freed buffers by rounded size
+        # instead of requiring exact (name, size) match.
+        self._pool_free = {}      # rounded_size -> [WGPUBuffer, ...]
+        self._pool_alloc = 0      # total buffers created via pool
+        self._pool_reuse = 0      # total buffers reused from pool
+        self._pool_bytes = 0      # total bytes allocated via pool
+
     def gpu_memory_stats(self) -> dict:
         """Return GPU memory usage statistics.
 
         Tracks all buffers allocated via this runner:
         - buffer_cache: internal kernel I/O buffers (reused per dispatch)
         - upload_to_gpu: weight and data buffers (permanent, owned)
+        - pool: size-class pooled transient buffers
         """
         cache_bytes = sum(size for (_, size, _) in self._buffer_cache.keys())
+        pool_free_count = sum(len(v) for v in self._pool_free.values())
         return {
             'total_allocated_mb': self._total_gpu_bytes / 1024 / 1024,
             'buffer_cache_entries': len(self._buffer_cache),
             'buffer_cache_mb': cache_bytes / 1024 / 1024,
             'pipeline_cache_entries': len(self._pipeline_cache),
             'alloc_count': self._gpu_alloc_count,
+            'pool_alloc': self._pool_alloc,
+            'pool_reuse': self._pool_reuse,
+            'pool_free': pool_free_count,
+            'pool_bytes_mb': self._pool_bytes / 1024 / 1024,
         }
 
     @property
@@ -1247,14 +1306,7 @@ class DawnRunner:
         self._batch_readbacks = []  # list of (gpu_buf, size, bindings) to readback
 
     def end_batch(self, readback_buffers=None):
-        """Submit all batched dispatches and optionally readback results.
-
-        Args:
-            readback_buffers: optional list of GPUBuffer objects to read back
-
-        Returns:
-            dict mapping GPUBuffer → numpy array for requested readbacks
-        """
+        """Submit all batched dispatches and optionally readback results."""
         if not hasattr(self, '_batch_encoder') or self._batch_encoder is None:
             return {}
 
@@ -1263,7 +1315,7 @@ class DawnRunner:
 
         # Add readback copies for requested buffers
         results = {}
-        readback_mapping = {}  # rb_buf -> (gpu_buf, size)
+        readback_mapping = {}
         if readback_buffers:
             readback_usage = BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST
             for i, gpu_buf in enumerate(readback_buffers):
@@ -1392,6 +1444,66 @@ class DawnRunner:
             wgsl_code, buffer_bindings, param_fields)
         return pipeline, bg_layout
 
+    def create_compute_pipeline_async(self, wgsl_code, buffer_bindings,
+                                      param_fields):
+        """Schedule asynchronous pipeline creation on a worker thread.
+
+        Returns a Future that resolves to
+        (shader_module, pipeline, bg_layout, pipeline_layout).
+        """
+        return self._pipeline_executor.submit(
+            self._get_or_create_pipeline,
+            wgsl_code, buffer_bindings, param_fields)
+
+    def prefetch_pipelines_async(self, pipeline_specs, max_workers=None):
+        """Compile multiple pipelines concurrently.
+
+        Args:
+            pipeline_specs: iterable of (wgsl_code, buffer_bindings, param_fields)
+            max_workers: optional worker cap for this prefetch call
+
+        Returns:
+            Number of pipeline specs submitted for compilation.
+        """
+        if not pipeline_specs:
+            return 0
+
+        # Deduplicate by WGSL hash key.
+        dedup = {}
+        for wgsl_code, buffer_bindings, param_fields in pipeline_specs:
+            key = self._pipeline_cache_key(wgsl_code)
+            dedup[key] = (wgsl_code, buffer_bindings, param_fields)
+
+        pending_specs = []
+        with self._pipeline_cache_lock:
+            for key, spec in dedup.items():
+                if key not in self._pipeline_cache:
+                    pending_specs.append(spec)
+
+        if not pending_specs:
+            return 0
+
+        if max_workers is not None:
+            workers = max(1, int(max_workers))
+            executor = ThreadPoolExecutor(max_workers=workers)
+            owns_executor = True
+        else:
+            executor = self._pipeline_executor
+            owns_executor = False
+
+        futures = [
+            executor.submit(self._get_or_create_pipeline, wgsl, bbs, pfs)
+            for wgsl, bbs, pfs in pending_specs
+        ]
+        try:
+            for fut in as_completed(futures):
+                fut.result()
+        finally:
+            if owns_executor:
+                executor.shutdown(wait=True)
+
+        return len(pending_specs)
+
     def create_gpu_buffer(self, name, size_bytes):
         """Create a named GPU storage buffer.
 
@@ -1510,7 +1622,8 @@ class DawnRunner:
             return self._map_and_read(rb_buf, size, dtype)
         return None
 
-    def submit_dispatches_pipelined(self, layer_batches, readback=None):
+    def submit_dispatches_pipelined(self, layer_batches, readback=None,
+                                    profiler=None, dispatch_names=None):
         """Submit dispatch batches with CPU/GPU pipelining.
 
         Groups consecutive batches into larger encoder submissions to reduce
@@ -1532,6 +1645,7 @@ class DawnRunner:
         pass_desc.nextInChain = None
         pass_desc.label = WGPUStringView.from_str("")
         pass_desc.timestampWrites = None
+        dispatch_idx = 0
 
         group_start = 0
         while group_start < n_batches:
@@ -1551,6 +1665,30 @@ class DawnRunner:
                 dispatches = layer_batches[batch_idx]
 
                 for pipeline, bind_group, grid in dispatches:
+                    # Optional per-dispatch GPU timestamps for profiler.
+                    # We encode each dispatch in its own pass so timestampWrites
+                    # can be attached per operation.
+                    ts_ptr = None
+                    if profiler and profiler.enabled and profiler.gpu_enabled:
+                        if dispatch_names and dispatch_idx < len(dispatch_names):
+                            dname = dispatch_names[dispatch_idx]
+                        else:
+                            dname = "fast_decode/dispatch"
+                        b_idx, e_idx = profiler.allocate_gpu_timestamps(dname)
+                        if b_idx >= 0:
+                            ts_ptr = profiler.get_timestamp_writes_ptr(b_idx, e_idx)
+                    dispatch_idx += 1
+
+                    if ts_ptr is not None:
+                        pass_desc.timestampWrites = ctypes.cast(ts_ptr, ctypes.c_void_p)
+                        if compute_pass:
+                            lib.wgpuComputePassEncoderEnd(compute_pass)
+                            lib.wgpuComputePassEncoderRelease(compute_pass)
+                        compute_pass = lib.wgpuCommandEncoderBeginComputePass(
+                            encoder, ctypes.byref(pass_desc))
+                    else:
+                        pass_desc.timestampWrites = None
+
                     lib.wgpuComputePassEncoderSetPipeline(compute_pass, pipeline)
                     lib.wgpuComputePassEncoderSetBindGroup(
                         compute_pass, 0, bind_group, 0, None)
@@ -1792,10 +1930,11 @@ class DawnRunner:
         Pipelines are cached by WGSL code hash — the shader, layout, and
         pipeline are created once and reused across calls.
         """
-        import hashlib
-        key = hashlib.sha256(wgsl_code.encode()).hexdigest()
-        if key in self._pipeline_cache:
-            return self._pipeline_cache[key]
+        key = self._pipeline_cache_key(wgsl_code)
+        with self._pipeline_cache_lock:
+            cached = self._pipeline_cache.get(key)
+        if cached is not None:
+            return cached
 
         lib = self._lib
 
@@ -1875,25 +2014,152 @@ class DawnRunner:
         cp_desc.compute.constantCount = 0
         cp_desc.compute.constants = None
 
-        pipeline = lib.wgpuDeviceCreateComputePipeline(
-            self._device, ctypes.byref(cp_desc)
-        )
+        if getattr(self, '_has_async_compute_pipeline', False):
+            pipeline_holder = [None]
+            pipeline_error = [None]
+
+            @CreateComputePipelineAsyncCallback
+            def on_pipeline(status, pipeline_obj, message, ud1, ud2,
+                            _holder=pipeline_holder, _err=pipeline_error):
+                if status == WGPUCreatePipelineAsyncStatus.Success:
+                    _holder[0] = pipeline_obj
+                else:
+                    msg = ""
+                    if message.data:
+                        msg = message.data.decode("utf-8", errors="replace")
+                    _err[0] = msg or f"status={status}"
+
+            cb_info = WGPUCreateComputePipelineAsyncCallbackInfo()
+            cb_info.nextInChain = None
+            cb_info.mode = WGPUCallbackMode.WaitAnyOnly
+            cb_info.callback = on_pipeline
+            cb_info.userdata1 = None
+            cb_info.userdata2 = None
+
+            future = lib.wgpuDeviceCreateComputePipelineAsync(
+                self._device, ctypes.byref(cp_desc), cb_info)
+            wait_info = WGPUFutureWaitInfo()
+            wait_info.future = future
+            wait_info.completed = 0
+            lib.wgpuInstanceWaitAny(
+                self._instance, 1, ctypes.byref(wait_info),
+                ctypes.c_uint64(-1))
+
+            pipeline = pipeline_holder[0]
+            if not pipeline:
+                err = pipeline_error[0] or "unknown error"
+                raise RuntimeError(f"Failed to create compute pipeline (async): {err}")
+        else:
+            pipeline = lib.wgpuDeviceCreateComputePipeline(
+                self._device, ctypes.byref(cp_desc)
+            )
         if not pipeline:
             raise RuntimeError("Failed to create compute pipeline")
 
         result = (shader_module, pipeline, bg_layout, pipeline_layout)
-        self._pipeline_cache[key] = result
+        with self._pipeline_cache_lock:
+            existing = self._pipeline_cache.get(key)
+            if existing is not None:
+                # Another thread won the race; release duplicate resources.
+                lib.wgpuComputePipelineRelease(pipeline)
+                lib.wgpuShaderModuleRelease(shader_module)
+                lib.wgpuBindGroupLayoutRelease(bg_layout)
+                lib.wgpuPipelineLayoutRelease(pipeline_layout)
+                return existing
+            self._pipeline_cache[key] = result
         return result
+
+    @staticmethod
+    def _pipeline_cache_key(wgsl_code: str) -> str:
+        import hashlib
+        return hashlib.sha256(wgsl_code.encode()).hexdigest()
+
+    @staticmethod
+    def _round_to_size_class(size):
+        """Round buffer size up to the next size class for pool reuse.
+
+        Size classes balance fragmentation vs reuse:
+          - Below 256 bytes: round to 256 (minimum WebGPU buffer)
+          - 256 – 4KB: round to next multiple of 256
+          - 4KB – 64KB: round to next power of 2
+          - 64KB+: round to next power of 2
+
+        This ensures buffers with similar sizes share pool slots,
+        reducing total GPU allocations by ~50%.
+        """
+        if size <= 256:
+            return 256
+        if size <= 4096:
+            return ((size + 255) // 256) * 256
+        # Power of 2 rounding for larger buffers
+        p = 1
+        while p < size:
+            p <<= 1
+        return p
+
+    def _pool_acquire(self, size, usage):
+        """Acquire a buffer from the pool, or create a new one.
+
+        Buffers are bucketed by rounded size class. If a free buffer
+        of the right size class exists, it is reused (zero allocation
+        cost). Otherwise a new buffer is created at the rounded size.
+
+        Returns: (WGPUBuffer, actual_size)
+        """
+        rounded = self._round_to_size_class(size)
+        free_list = self._pool_free.get(rounded)
+        if free_list:
+            buf = free_list.pop()
+            self._pool_reuse += 1
+            return buf, rounded
+
+        # Create new buffer at the rounded size
+        lib = self._lib
+        buf_desc = WGPUBufferDescriptor()
+        buf_desc.nextInChain = None
+        buf_desc.label = WGPUStringView.from_str(f"pool_{rounded}")
+        buf_desc.usage = usage
+        buf_desc.size = rounded
+        buf_desc.mappedAtCreation = 0
+        buf = lib.wgpuDeviceCreateBuffer(self._device, ctypes.byref(buf_desc))
+        if not buf:
+            raise RuntimeError(f"Failed to create pool buffer (size={rounded})")
+        self._pool_alloc += 1
+        self._pool_bytes += rounded
+        self._total_gpu_bytes += rounded
+        self._gpu_alloc_count += 1
+        return buf, rounded
+
+    def _pool_release(self, buf, size):
+        """Return a buffer to the pool for future reuse.
+
+        The buffer is added to the free list for its size class.
+        It is NOT destroyed — it stays allocated on GPU and can be
+        immediately reused by the next _pool_acquire of the same class.
+        """
+        rounded = self._round_to_size_class(size)
+        if rounded not in self._pool_free:
+            self._pool_free[rounded] = []
+        self._pool_free[rounded].append(buf)
 
     def _get_or_create_buffer(self, name, size, usage):
         """Get a cached GPU buffer or create a new one.
 
-        Buffers are cached by (name, size, usage). If a buffer with the same
-        key exists, it is reused; otherwise a new one is created.
+        Named buffers (weights, persistent data) are cached by exact
+        (name, size, usage) key. Transient buffers (kernel I/O with
+        names starting with '__') use the size-class memory pool for
+        better reuse across different-sized operations.
         """
         key = (name, size, usage)
         if key in self._buffer_cache:
             return self._buffer_cache[key]
+
+        # Use the pool for transient/internal buffers
+        if name.startswith("__"):
+            buf, actual_size = self._pool_acquire(size, usage)
+            # Cache with rounded size so same name+size hits next time
+            self._buffer_cache[key] = buf
+            return buf
 
         lib = self._lib
         buf_desc = WGPUBufferDescriptor()
@@ -2252,10 +2518,17 @@ class DawnRunner:
         if lib is None:
             return
         try:
+            if hasattr(self, '_pipeline_executor') and self._pipeline_executor:
+                self._pipeline_executor.shutdown(wait=False)
             # Release cached buffers
             for buf in getattr(self, '_buffer_cache', {}).values():
                 lib.wgpuBufferDestroy(buf)
                 lib.wgpuBufferRelease(buf)
+            # Release pooled free buffers
+            for bufs in getattr(self, '_pool_free', {}).values():
+                for buf in bufs:
+                    lib.wgpuBufferDestroy(buf)
+                    lib.wgpuBufferRelease(buf)
             # Release cached pipelines
             for sm, pipe, bgl, pl in getattr(self, '_pipeline_cache', {}).values():
                 lib.wgpuComputePipelineRelease(pipe)
