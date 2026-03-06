@@ -1058,16 +1058,12 @@ class DawnRunner:
         opts = WGPURequestAdapterOptions()
         opts.nextInChain = ctypes.cast(ctypes.pointer(adapter_toggles), ctypes.POINTER(WGPUChainedStruct))
         opts.featureLevel = WGPUFeatureLevel.Core
-
-        # GPU selection via DAWN_GPU environment variable:
-        #   DAWN_GPU=0 or "high" → HighPerformance (discrete GPU, default)
-        #   DAWN_GPU=1 or "low"  → LowPower (integrated GPU)
-        gpu_env = os.environ.get("DAWN_GPU", "").strip().lower()
-        if gpu_env in ("1", "low", "integrated"):
+        # Select GPU via DAWN_GPU env var: "high" (discrete, default) or "low" (integrated)
+        gpu_pref = os.environ.get("DAWN_GPU", "high").lower()
+        if gpu_pref == "low":
             opts.powerPreference = WGPUPowerPreference.LowPower
         else:
             opts.powerPreference = WGPUPowerPreference.HighPerformance
-
         opts.forceFallbackAdapter = 0
         opts.backendType = WGPUBackendType.D3D12  # Use D3D12 on Windows
         opts.compatibleSurface = None
@@ -1303,10 +1299,26 @@ class DawnRunner:
         enc_desc.label = WGPUStringView.from_str("batch")
         self._batch_encoder = lib.wgpuDeviceCreateCommandEncoder(
             self._device, ctypes.byref(enc_desc))
-        self._batch_readbacks = []  # list of (gpu_buf, size, bindings) to readback
+        self._batch_readbacks = []
 
+
+    def copy_buffer_in_batch(self, src_handle, src_offset,
+                             dst_handle, dst_offset, size_bytes):
+        """Encode a GPU-to-GPU buffer copy within the current batch."""
+        if not hasattr(self, '_batch_encoder') or self._batch_encoder is None:
+            raise RuntimeError('copy_buffer_in_batch called outside of batch')
+        self._lib.wgpuCommandEncoderCopyBufferToBuffer(
+            self._batch_encoder, src_handle, src_offset,
+            dst_handle, dst_offset, size_bytes)
     def end_batch(self, readback_buffers=None):
-        """Submit all batched dispatches and optionally readback results."""
+        """Submit all batched dispatches and optionally readback results.
+
+        Args:
+            readback_buffers: optional list of GPUBuffer objects to read back
+
+        Returns:
+            dict mapping GPUBuffer → numpy array for requested readbacks
+        """
         if not hasattr(self, '_batch_encoder') or self._batch_encoder is None:
             return {}
 
@@ -1315,7 +1327,7 @@ class DawnRunner:
 
         # Add readback copies for requested buffers
         results = {}
-        readback_mapping = {}
+        readback_mapping = {}  # rb_buf -> (gpu_buf, size)
         if readback_buffers:
             readback_usage = BUFFER_USAGE_MAP_READ | BUFFER_USAGE_COPY_DST
             for i, gpu_buf in enumerate(readback_buffers):
@@ -1899,26 +1911,31 @@ class DawnRunner:
         if not dst_buf:
             raise RuntimeError(f"Failed to create GPU buffer '{name}'")
 
-        # Encode GPU-to-GPU copy
-        enc_desc = WGPUCommandEncoderDescriptor()
-        enc_desc.nextInChain = None
-        enc_desc.label = WGPUStringView.from_str("")
-        encoder = lib.wgpuDeviceCreateCommandEncoder(
-            self._device, ctypes.byref(enc_desc))
-        lib.wgpuCommandEncoderCopyBufferToBuffer(
-            encoder, gpu_buffer.handle, offset_bytes, dst_buf, 0, size_bytes)
-        cb_desc = WGPUCommandBufferDescriptor()
-        cb_desc.nextInChain = None
-        cb_desc.label = WGPUStringView.from_str("")
-        cmd_buf = lib.wgpuCommandEncoderFinish(
-            encoder, ctypes.byref(cb_desc))
-        cmd_bufs = (ctypes.c_void_p * 1)(cmd_buf)
-        lib.wgpuQueueSubmit(
-            self._queue, 1,
-            ctypes.cast(cmd_bufs, ctypes.POINTER(WGPUCommandBuffer)))
-
-        lib.wgpuCommandBufferRelease(cmd_buf)
-        lib.wgpuCommandEncoderRelease(encoder)
+        # Batch-aware: use batch encoder if available
+        if self.is_batching:
+            lib.wgpuCommandEncoderCopyBufferToBuffer(
+                self._batch_encoder, gpu_buffer.handle, offset_bytes,
+                dst_buf, 0, size_bytes)
+        else:
+            enc_desc = WGPUCommandEncoderDescriptor()
+            enc_desc.nextInChain = None
+            enc_desc.label = WGPUStringView.from_str("")
+            encoder = lib.wgpuDeviceCreateCommandEncoder(
+                self._device, ctypes.byref(enc_desc))
+            lib.wgpuCommandEncoderCopyBufferToBuffer(
+                encoder, gpu_buffer.handle, offset_bytes,
+                dst_buf, 0, size_bytes)
+            cb_desc = WGPUCommandBufferDescriptor()
+            cb_desc.nextInChain = None
+            cb_desc.label = WGPUStringView.from_str("")
+            cmd_buf = lib.wgpuCommandEncoderFinish(
+                encoder, ctypes.byref(cb_desc))
+            cmd_bufs = (ctypes.c_void_p * 1)(cmd_buf)
+            lib.wgpuQueueSubmit(
+                self._queue, 1,
+                ctypes.cast(cmd_bufs, ctypes.POINTER(WGPUCommandBuffer)))
+            lib.wgpuCommandBufferRelease(cmd_buf)
+            lib.wgpuCommandEncoderRelease(encoder)
 
         return GPUBuffer(self, dst_buf, size_bytes,
                          gpu_buffer.dtype, None)
@@ -2416,6 +2433,10 @@ class DawnRunner:
             if bb.name in buffers and bb.access == 'read_write':
                 if gpu_outputs and bb.name in gpu_outputs:
                     continue  # skip — will return GPUBuffer
+                # Skip buffers that were passed as pre-uploaded GPUBuffer
+                # (they're inputs, not outputs needing readback)
+                if isinstance(buffers.get(bb.name), GPUBuffer):
+                    continue
                 size = gpu_buf_sizes[bb.name]
                 rb_buf = self._get_or_create_buffer(
                     f"__rb_{bb.name}__", size, readback_usage)
